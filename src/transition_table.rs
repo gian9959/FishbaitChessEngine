@@ -39,6 +39,10 @@ impl TranspositionTable {
         let idx = (entry.hash.0 as usize) % self.size;
         self.entries[idx] = Some(entry);
     }
+
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
     
     pub fn get_len(&self) -> i32 {
         let mut len = 0;

@@ -5,7 +5,8 @@ use fishbait_engine::{Fishbait, OpeningBook};
 
 fn main() {
     let stdin = io::stdin();
-    let mut fishbait = None;
+    let mut book = OpeningBook::from_embedded();
+    let mut fishbait = Fishbait::new(Color::White, Some(100), Some(book));
 
     for line in stdin.lock().lines() {
         let msg = parse_one(&line.unwrap());
@@ -20,42 +21,23 @@ fn main() {
                 println!("readyok");
                 io::stdout().flush().unwrap();
             }
+            UciMessage::UciNewGame => {
+                book = OpeningBook::from_embedded();
+                fishbait = Fishbait::new(Color::White, Some(100), Some(book));
+            }
             UciMessage::Position { startpos, fen, moves } => {
-                if fishbait.is_none() || startpos {
-
-                    // load opening book
-                    let opening_book = Some(OpeningBook::from_embedded());
-
-                    // determine color
-                    let color = if moves.len() % 2 == 0 {
-                        Color::White
-                    } else {
-                        Color::Black
-                    };
-                    // create new engine
-                    fishbait = Some(if let Some(f) = fen {
-                        Fishbait::from_fen(&f.to_string(), color, None, opening_book).unwrap()
-                    } else {
-                        Fishbait::new(color, None, opening_book)
-                    });
-                }
-
-                if let Some(ref mut e) = fishbait {
-                    let already_played = e.move_count();
-                    for mv in moves.iter().skip(already_played) {
-                        e.make_move_uci(&mv.to_string()).unwrap();
-                    }
+                let fen_str = if startpos { None } else { fen.map(|f| f.to_string()) };
+                let moves: Vec<String> = moves.iter().map(|m| m.to_string()).collect();
+                if let Err(e) = fishbait.set_position(fen_str.as_deref(), &moves) {
+                    eprintln!("position error: {}", e);
                 }
             }
             UciMessage::Go { time_control, .. } => {
+                fishbait.set_color_uci();
                 let time_limit = match time_control {
                     Some(UciTimeControl::MoveTime(duration)) => duration,
                     Some(UciTimeControl::TimeLeft { white_time, black_time, .. }) => {
-                        let t = if fishbait.as_ref().unwrap().get_color() == Color::White {
-                            white_time
-                        } else {
-                            black_time
-                        };
+                        let t = if fishbait.get_color() == Color::White { white_time } else { black_time };
                         match t {
                             Some(t) => t / 15,
                             None => chrono::Duration::seconds(30),
@@ -63,15 +45,13 @@ fn main() {
                     }
                     _ => chrono::Duration::seconds(30),
                 };
-                if let Some(ref mut e) = fishbait {
-                    let result = e.search(time_limit.to_std().unwrap(), true);
-                    let uci_move = shakmaty::uci::UciMove::from_move(
-                        result.best_move,
-                        shakmaty::CastlingMode::Standard
-                    );
-                    println!("bestmove {}", uci_move);
-                    io::stdout().flush().unwrap();
-                }
+                let result = fishbait.search(time_limit.to_std().unwrap(), true);
+                let uci_move = shakmaty::uci::UciMove::from_move(
+                    result.best_move,
+                    shakmaty::CastlingMode::Standard,
+                );
+                println!("bestmove {}", uci_move);
+                io::stdout().flush().unwrap();
             }
             UciMessage::Quit => break,
             _ => {}

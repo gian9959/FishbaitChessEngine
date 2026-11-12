@@ -13,7 +13,7 @@ pub use crate::opening_book::OpeningBook;
 
 pub struct Fishbait {
     engine: Engine,
-    opening_book: Option<OpeningBook>
+    opening_book: Option<OpeningBook>,
 }
 
 impl Fishbait {
@@ -36,6 +36,28 @@ impl Fishbait {
             engine: Engine::new(game.clone(), color),
             opening_book: polyglot_book
         })
+    }
+
+    pub fn set_position(&mut self, fen: Option<&str>, moves: &[String]) -> Result<(), Box<dyn Error>> {
+        let max_moves = self.engine.game.get_max_moves();
+        let mut game = match fen {
+            Some(f) => {
+                let fen: Fen = f.parse()?;
+                Game::from_pos(fen.into_position(CastlingMode::Standard)?)
+            }
+            None => Game::new(),
+        };
+        game.set_max_moves(max_moves);
+        self.engine.set_game(game);
+        for mv in moves {
+            self.make_move_uci(mv)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_color_uci(&mut self) {
+        let color = self.engine.game.current().turn();
+        self.set_color(color);
     }
 
     pub fn set_color(&mut self, color: Color) {
