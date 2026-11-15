@@ -67,12 +67,12 @@ impl Game {
         }
     }
 
-    pub fn is_threefold_repetition(&self) -> bool {
+    pub fn count_repetitions(&self, r: usize) -> bool {
         let n = self.hashes.len();
         let back = (self.current().halfmoves() as usize).min(n - 1);
         let cur = self.hashes[n - 1];
         let count = 1 + (2..=back).step_by(2).filter(|&i| self.hashes[n - 1 - i] == cur).count();
-        count >= 3
+        count >= r
     }
 
     pub fn maxed_moves(&self) -> bool {
@@ -188,11 +188,11 @@ impl Engine {
     }
 
     fn print_info(&self, mut depth: i32) {
-        let mut pv_str = shakmaty::uci::UciMove::from_move(self.best_move.unwrap(), shakmaty::CastlingMode::Standard).to_string();
+        let mut pv_str = shakmaty::uci::UciMove::from_move(self.best_move.unwrap(), CastlingMode::Standard).to_string();
         if depth > 0 {
             let pv = self.extract_pv(depth);
             pv_str = pv.iter()
-                .map(|m| shakmaty::uci::UciMove::from_move(*m, shakmaty::CastlingMode::Standard).to_string())
+                .map(|m| shakmaty::uci::UciMove::from_move(*m, CastlingMode::Standard).to_string())
                 .collect::<Vec<_>>()
                 .join(" ");
         } else {
@@ -204,7 +204,7 @@ impl Engine {
         println!("info depth {} score cp {} nodes {} time {} pv {}",
                  depth,
                  self.best_score,
-                 self.iterations + self.q_iterations,
+                 self.iterations + self.q_iterations + self.memo_iterations,
                  self.start_timer.elapsed().as_millis(),
                  pv_str
         );
@@ -277,12 +277,15 @@ impl Engine {
         // start move timer
         self.start_timer = Instant::now();
 
+        // transition table on/off
+        let tt_switch = !self.game.count_repetitions(2);
+
         // with iterative deepening
         for depth in 1..=self.max_depth {
 
             let score = if depth <= 2 {
                 // first two iterations have a "full" window
-                self.minimax(depth, true, -INF, INF, false)
+                self.minimax(depth, true, -INF, INF, false, tt_switch)
             } else {
                 // use aspiration window on later iterations
                 let mut delta = 50;
@@ -290,7 +293,7 @@ impl Engine {
                 let mut beta = prev_res[depth as usize - 2].score + delta;
 
                 loop {
-                    let score = self.minimax(depth, true, alpha, beta, false);
+                    let score = self.minimax(depth, true, alpha, beta, false, tt_switch);
 
                     match score {
                         None => { return prev_res[depth as usize - 2].clone() }
@@ -377,7 +380,7 @@ impl Engine {
         score
     }
 
-    fn quiescence_search(&mut self, depth: i32, mut alpha: i32, mut beta: i32) -> Option<i32> {
+    fn quiescence_search(&mut self, depth: i32, mut alpha: i32, mut beta: i32, tt: bool) -> Option<i32> {
 
         if self.is_timeout() {
             return None;
@@ -390,12 +393,9 @@ impl Engine {
 
         // memoization with Zobrist hashes
         if let Some(entry) = self.q_hash_table.get(h) {
-            self.memo_iterations += 1;
             h_move = entry.best_move;
-            if entry.depth >= depth {
-                if self.game.maxed_moves() || self.game.is_threefold_repetition() {
-                    return Some(0);
-                }
+            if tt && entry.depth >= depth {
+                self.memo_iterations += 1;
                 match entry.entry_type {
                     EntryType::Exact => return Some(entry.score),
                     EntryType::LowerBound => alpha = alpha.max(entry.score),
@@ -422,7 +422,7 @@ impl Engine {
         }
 
         // draw by special case
-        if self.game.maxed_moves() || self.game.is_threefold_repetition() {
+        if self.game.maxed_moves() || self.game.count_repetitions(3) {
             return Some(0);
         }
 
@@ -451,7 +451,7 @@ impl Engine {
 
             if self.game.push(m).is_err() { continue; }
 
-            let score = self.quiescence_search(depth - 1, alpha, beta);
+            let score = self.quiescence_search(depth - 1, alpha, beta, tt);
 
             self.game.pop();
 
@@ -494,7 +494,7 @@ impl Engine {
         Some(best_score)
     }
 
-    pub fn minimax(&mut self, depth: i32, is_root: bool, mut alpha: i32, mut beta: i32, null_move: bool) -> Option<i32> {
+    pub fn minimax(&mut self, depth: i32, is_root: bool, mut alpha: i32, mut beta: i32, null_move: bool, tt: bool) -> Option<i32> {
 
         if self.is_timeout() {
             return None;
@@ -508,11 +508,8 @@ impl Engine {
         // memoization with Zobrist hashes
         if let Some(entry) = self.hash_table.get(h) {
             h_move = entry.best_move;
-            if !is_root && entry.depth >= depth {
+            if !is_root && tt && entry.depth >= depth {
                 self.memo_iterations += 1;
-                if self.game.maxed_moves() || self.game.is_threefold_repetition() {
-                    return Some(0);
-                }
                 match entry.entry_type {
                     EntryType::Exact => return Some(entry.score),
                     EntryType::LowerBound => alpha = alpha.max(entry.score),
@@ -530,7 +527,7 @@ impl Engine {
         // max depth reached
         // start quiescence search
         if depth <= 0 {
-            return self.quiescence_search(-1, alpha, beta)
+            return self.quiescence_search(-1, alpha, beta, tt)
         }
 
         let mut moves = self.game.current().legal_moves();
@@ -545,7 +542,7 @@ impl Engine {
         }
 
         // draw by a special case
-        if self.game.maxed_moves() || self.game.is_threefold_repetition() {
+        if self.game.maxed_moves() || self.game.count_repetitions(3) {
             return Some(0);
         }
 
@@ -557,7 +554,7 @@ impl Engine {
             if !self.game.null_move().is_err() {
 
                 // reduced search
-                let null_score = self.minimax(depth - NMP, false, alpha, beta, true);
+                let null_score = self.minimax(depth - NMP, false, alpha, beta, true, tt);
 
                 self.game.pop();
 
@@ -583,16 +580,16 @@ impl Engine {
             // Late Move Reduction (LMR)
             let score = if i >= LMR_T1 as usize && depth >= LMR && !self.game.current().is_check() && !m.is_capture() && !is_endgame {
                 let r_depth = if i >= LMR_T2 as usize { LMR } else { LMR-1 };
-                let red_score = self.minimax(depth - r_depth, false, alpha, beta, false);
+                let red_score = self.minimax(depth - r_depth, false, alpha, beta, false, tt);
                 if red_score > Some(alpha) {
                     // move is promising despite being late in the order, full search
-                    self.minimax(depth-1, false, alpha, beta, false)
+                    self.minimax(depth-1, false, alpha, beta, false, tt)
                 } else {
                     red_score
                 }
             } else {
                 // normal search
-                self.minimax(depth-1, false, alpha, beta, false)
+                self.minimax(depth-1, false, alpha, beta, false, tt)
             };
 
             // pop move to go up the tre
