@@ -277,15 +277,12 @@ impl Engine {
         // start move timer
         self.start_timer = Instant::now();
 
-        // transition table on/off
-        let tt_switch = !self.game.count_repetitions(2);
-
         // with iterative deepening
         for depth in 1..=self.max_depth {
 
             let score = if depth <= 2 {
                 // first two iterations have a "full" window
-                self.minimax(depth, true, -INF, INF, false, tt_switch)
+                self.minimax(depth, true, -INF, INF, false)
             } else {
                 // use aspiration window on later iterations
                 let mut delta = 50;
@@ -293,7 +290,7 @@ impl Engine {
                 let mut beta = prev_res[depth as usize - 2].score + delta;
 
                 loop {
-                    let score = self.minimax(depth, true, alpha, beta, false, tt_switch);
+                    let score = self.minimax(depth, true, alpha, beta, false);
 
                     match score {
                         None => { return prev_res[depth as usize - 2].clone() }
@@ -380,21 +377,20 @@ impl Engine {
         score
     }
 
-    fn quiescence_search(&mut self, depth: i32, mut alpha: i32, mut beta: i32, tt: bool) -> Option<i32> {
+    fn quiescence_search(&mut self, depth: i32, mut alpha: i32, mut beta: i32) -> Option<i32> {
 
+        // check timer
         if self.is_timeout() {
             return None;
         }
 
-        let is_max = self.game.current().turn() == self.color;
-
+        // memoization with Zobrist hashes
         let h: Zobrist64 = self.game.current().zobrist_hash(EnPassantMode::Legal);
         let mut h_move: Option<Move> = None;
 
-        // memoization with Zobrist hashes
         if let Some(entry) = self.q_hash_table.get(h) {
             h_move = entry.best_move;
-            if tt && entry.depth >= depth {
+            if entry.depth >= depth {
                 self.memo_iterations += 1;
                 match entry.entry_type {
                     EntryType::Exact => return Some(entry.score),
@@ -410,6 +406,7 @@ impl Engine {
 
         self.q_iterations += 1;
 
+        let is_max = self.game.current().turn() == self.color;
         let moves = self.game.current().legal_moves();
 
         // check if game ended
@@ -451,7 +448,7 @@ impl Engine {
 
             if self.game.push(m).is_err() { continue; }
 
-            let score = self.quiescence_search(depth - 1, alpha, beta, tt);
+            let score = self.quiescence_search(depth - 1, alpha, beta);
 
             self.game.pop();
 
@@ -494,21 +491,30 @@ impl Engine {
         Some(best_score)
     }
 
-    pub fn minimax(&mut self, depth: i32, is_root: bool, mut alpha: i32, mut beta: i32, null_move: bool, tt: bool) -> Option<i32> {
+    pub fn minimax(&mut self, depth: i32, is_root: bool, mut alpha: i32, mut beta: i32, null_move: bool) -> Option<i32> {
 
+        // check timer
         if self.is_timeout() {
             return None;
         }
 
-        let is_max = self.game.current().turn() == self.color;
+        // check draw before tt
+        if !is_root {
+            if !null_move && self.game.count_repetitions(2) {
+                return Some(0);
+            }
+            if self.game.maxed_moves() && !self.game.current().is_checkmate() {
+                return Some(0);
+            }
+        }
 
+        // memoization with Zobrist hashes
         let h: Zobrist64 = self.game.current().zobrist_hash(EnPassantMode::Legal);
         let mut h_move: Option<Move> = None;
 
-        // memoization with Zobrist hashes
         if let Some(entry) = self.hash_table.get(h) {
             h_move = entry.best_move;
-            if !is_root && tt && entry.depth >= depth {
+            if !is_root && entry.depth >= depth {
                 self.memo_iterations += 1;
                 match entry.entry_type {
                     EntryType::Exact => return Some(entry.score),
@@ -519,7 +525,6 @@ impl Engine {
                     return Some(entry.score);
                 }
             }
-
         }
 
         self.iterations += 1;
@@ -527,10 +532,11 @@ impl Engine {
         // max depth reached
         // start quiescence search
         if depth <= 0 {
-            return self.quiescence_search(-1, alpha, beta, tt)
+            return self.quiescence_search(-1, alpha, beta)
         }
 
         let mut moves = self.game.current().legal_moves();
+        let is_max = self.game.current().turn() == self.color;
 
         // end condition by no other moves
         if moves.is_empty() {
@@ -541,11 +547,6 @@ impl Engine {
             }
         }
 
-        // draw by a special case
-        if self.game.maxed_moves() || self.game.count_repetitions(3) {
-            return Some(0);
-        }
-
         let is_endgame = self.game.is_endgame();
         let has_captures = moves.iter().any(|m| m.is_capture());
 
@@ -554,7 +555,7 @@ impl Engine {
             if !self.game.null_move().is_err() {
 
                 // reduced search
-                let null_score = self.minimax(depth - NMP, false, alpha, beta, true, tt);
+                let null_score = self.minimax(depth - NMP, false, alpha, beta, true);
 
                 self.game.pop();
 
@@ -580,16 +581,16 @@ impl Engine {
             // Late Move Reduction (LMR)
             let score = if i >= LMR_T1 as usize && depth >= LMR && !self.game.current().is_check() && !m.is_capture() && !is_endgame {
                 let r_depth = if i >= LMR_T2 as usize { LMR } else { LMR-1 };
-                let red_score = self.minimax(depth - r_depth, false, alpha, beta, false, tt);
+                let red_score = self.minimax(depth - r_depth, false, alpha, beta, false);
                 if red_score > Some(alpha) {
                     // move is promising despite being late in the order, full search
-                    self.minimax(depth-1, false, alpha, beta, false, tt)
+                    self.minimax(depth-1, false, alpha, beta, false)
                 } else {
                     red_score
                 }
             } else {
                 // normal search
-                self.minimax(depth-1, false, alpha, beta, false, tt)
+                self.minimax(depth-1, false, alpha, beta, false)
             };
 
             // pop move to go up the tre
@@ -601,10 +602,10 @@ impl Engine {
             }
 
             let is_better = if is_max { score > Some(best_score) } else { score < Some(best_score) };
-            // if it's near the root of the tree (the possible next move) save the best move
+            // if it's the root of the tree (the possible next move) save the best move
             if is_better || local_best_move.is_none() {
                 if is_root {
-                    self.best_move = Some(m.clone());
+                    self.best_move = Some(*m);
                 }
                 local_best_move = Some(*m);
             }
