@@ -83,8 +83,8 @@ impl Fishbait {
         Ok(())
     }
 
-    pub fn search(&mut self, max_time: Duration, print: bool) -> SearchResult {
-        self.engine.set_timer(max_time);
+    pub fn search(&mut self, soft_timer: Duration, hard_timer: Duration, print: bool) -> SearchResult {
+        self.engine.set_timer(soft_timer, hard_timer);
         self.engine.play(&self.opening_book, print)
     }
 

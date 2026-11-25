@@ -111,7 +111,11 @@ pub struct Engine {
     pub game: Game,
     color: Color,
     max_depth: i32,
-    max_time: Duration,
+
+    soft_timer: Duration,
+    hard_timer: Duration,
+    stopped: bool,
+    time_check: u32,
 
     best_move: Option<Move>,
     best_score: i32,
@@ -124,6 +128,10 @@ pub struct Engine {
     iterations: i32,
     q_iterations: i32,
     memo_iterations: i32,
+    nmp_iterations: i32,
+    nmp_success: i32,
+    lmr_iterations: i32,
+    lmr_success: i32,
 }
 
 impl Engine {
@@ -132,7 +140,11 @@ impl Engine {
             game: g,
             color: c,
             max_depth: 30,
-            max_time: Duration::from_secs(30),
+
+            soft_timer: Duration::from_secs(30),
+            hard_timer: Duration::from_secs(30),
+            stopped: false,
+            time_check: 0,
 
             best_move: None,
             best_score: 0,
@@ -144,6 +156,10 @@ impl Engine {
             iterations: 0,
             q_iterations: 0,
             memo_iterations: 0,
+            nmp_iterations: 0,
+            nmp_success: 0,
+            lmr_iterations: 0,
+            lmr_success: 0,
         }
     }
 
@@ -158,8 +174,9 @@ impl Engine {
         self.max_depth = max_depth;
     }
 
-    pub fn set_timer(&mut self, max_time: Duration) {
-        self.max_time = max_time;
+    pub fn set_timer(&mut self, soft: Duration, hard: Duration) {
+        self.soft_timer = soft;
+        self.hard_timer = hard.max(soft);
     }
 
     pub fn set_color(&mut self, color: Color) {
@@ -183,8 +200,15 @@ impl Engine {
         (self.iterations, self.q_iterations, self.memo_iterations, self.hash_table.get_len(), self.q_hash_table.get_len())
     }
 
-    pub fn is_timeout(&self) -> bool {
-        self.start_timer.elapsed() >= self.max_time
+    pub fn is_timeout(&mut self) -> bool {
+        self.time_check += 1;
+        if self.time_check >= 2048 {
+            self.time_check = 0;
+            if self.start_timer.elapsed() >= self.hard_timer {
+                self.stopped = true;
+            }
+        }
+        self.stopped
     }
 
     fn print_info(&self, mut depth: i32) {
@@ -276,6 +300,13 @@ impl Engine {
 
         // start move timer
         self.start_timer = Instant::now();
+        self.stopped = false;
+        self.time_check = 0;
+
+        let only_move = self.game.current().legal_moves().len() <= 1;
+        let mut stable = 0;
+        let mut prev_best: Option<Move> = None;
+        let mut prev_score = 0;
 
         // with iterative deepening
         for depth in 1..=self.max_depth {
@@ -292,11 +323,9 @@ impl Engine {
                 loop {
                     let score = self.minimax(depth, true, alpha, beta, false);
 
-                    match score {
-                        None => { return prev_res[depth as usize - 2].clone() }
-                        _ => {}
+                    if score.is_none() {
+                        break None;
                     }
-
                     if score <= Some(alpha) {
                         alpha -= delta;
                         delta *= 2;
@@ -309,7 +338,15 @@ impl Engine {
                 }
             };
 
-            self.best_score = score.unwrap();
+            // iteration interrupted, use last valid
+            let Some(score) = score else {
+                return prev_res.last().cloned().unwrap_or_else(|| SearchResult {
+                    best_move: self.game.current().legal_moves()[0],
+                    score: 0,
+                });
+            };
+
+            self.best_score = score;
 
             prev_res.push(SearchResult {
                 best_move: self.best_move.unwrap(),
@@ -326,6 +363,33 @@ impl Engine {
             if print_info {
                 self.print_info(depth);
             }
+
+            // only one move available or no moves at all
+            if only_move {
+                break;
+            }
+
+            // dynamic soft timer
+            if depth > 1 && self.best_move == prev_best { stable += 1 } else { stable = 0 }
+
+            let mut target = self.soft_timer.as_millis() as u64;
+            target = match stable {
+                0 => target * 13 / 10,
+                1 | 2 => target,
+                _ => target * 6 / 10,
+            };
+            if depth > 1 && prev_score - self.best_score > 30 {
+                target = target * 15 / 10;
+            }
+            target = target.min(self.hard_timer.as_millis() as u64);
+
+            let elapsed = self.start_timer.elapsed().as_millis() as u64;
+            if elapsed >= target * 6 / 10 {
+                break;
+            }
+
+            prev_best = self.best_move;
+            prev_score = self.best_score;
         }
         SearchResult {
             best_move: self.best_move.unwrap(),
@@ -554,12 +618,15 @@ impl Engine {
         if !null_move && depth >= NMP && !self.game.current().is_check() && !is_endgame && !has_captures && !is_root {
             if !self.game.null_move().is_err() {
 
+                self.nmp_iterations += 1;
+
                 // reduced search
                 let null_score = self.minimax(depth - NMP, false, alpha, beta, true);
 
                 self.game.pop();
 
                 if is_max && null_score >= Some(beta) {
+                    self.nmp_success += 1;
                     return Some(beta);
                 }
             }
@@ -580,12 +647,14 @@ impl Engine {
 
             // Late Move Reduction (LMR)
             let score = if i >= LMR_T1 as usize && depth >= LMR && !self.game.current().is_check() && !m.is_capture() && !is_endgame {
+                self.lmr_iterations += 1;
                 let r_depth = if i >= LMR_T2 as usize { LMR } else { LMR-1 };
                 let red_score = self.minimax(depth - r_depth, false, alpha, beta, false);
                 if red_score > Some(alpha) {
                     // move is promising despite being late in the order, full search
                     self.minimax(depth-1, false, alpha, beta, false)
                 } else {
+                    self.lmr_success += 1;
                     red_score
                 }
             } else {
