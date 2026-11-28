@@ -7,20 +7,14 @@ pub const INF: i32 = 100_000_000;
 // depth reduction value of LMR
 pub const LMR: i32 = 3;
 
-// LMR first threshold
+// LMR threshold
 pub const LMR_T1: i32 = 2;
-
-// LMR second threshold
-pub const LMR_T2: i32 = 5;
 
 // depth reduction value of NMP
 pub const NMP: i32 = 3;
 
 // constant used for calculating phase of the game
-pub(crate) const PHASE_MAX: i32 = 2 * (2 * piece_value(Role::Knight)
-    + 2 * piece_value(Role::Bishop)
-    + 2 * piece_value(Role::Rook)
-    + piece_value(Role::Queen));
+pub const PHASE_MAX: i32 = 2 * (2 * piece_value(Role::Knight) + 2 * piece_value(Role::Bishop) + 2 * piece_value(Role::Rook) + piece_value(Role::Queen));
 
 pub const PAWN_TABLE_WHITE: [i32; 64] = [
     0,  0,  0,  0,  0,  0,  0,  0,
@@ -104,7 +98,7 @@ pub const KING_ENDGAME_TABLE_WHITE: [i32; 64] = [
 ];
 pub const KING_ENDGAME_TABLE_BLACK: [i32; 64] = reverse(KING_ENDGAME_TABLE_WHITE);
 
-pub fn piece_square_value(role: Role, color: Color, square: Square, board: &Board, phase: i32) -> i32 {
+pub fn piece_square_value(role: Role, color: Color, square: Square, board: &Board, phase: f32) -> i32 {
     let p_value = piece_value(role);
 
     let idx = square as usize;
@@ -117,8 +111,8 @@ pub fn piece_square_value(role: Role, color: Color, square: Square, board: &Boar
         (Role::Rook,   Color::White) => ROOK_TABLE_WHITE[idx],
         (Role::Rook,   Color::Black) => ROOK_TABLE_BLACK[idx],
         (Role::Queen,  _)            => QUEEN_TABLE[idx],
-        (Role::King,   Color::White) => (KING_TABLE_WHITE[idx] * phase + KING_ENDGAME_TABLE_WHITE[idx] * (PHASE_MAX - phase)) / PHASE_MAX,
-        (Role::King,   Color::Black) => (KING_TABLE_BLACK[idx] * phase + KING_ENDGAME_TABLE_BLACK[idx] * (PHASE_MAX - phase)) / PHASE_MAX,
+        (Role::King,   Color::White) => (KING_TABLE_WHITE[idx] as f32 * phase + KING_ENDGAME_TABLE_WHITE[idx] as f32 * (1.0 - phase)) as i32,
+        (Role::King,   Color::Black) => (KING_TABLE_BLACK[idx] as f32 * phase + KING_ENDGAME_TABLE_BLACK[idx] as f32 * (1.0 - phase)) as i32,
     };
 
     p_value + s_value
@@ -207,7 +201,7 @@ fn doubled_pawn_penalty(color: Color, square: Square, board: &Board) -> i32 {
     score
 }
 
-pub fn king_pawn_distance(color: Color, board: &Board, phase: i32) -> i32 {
+pub fn king_pawn_distance(color: Color, board: &Board, phase: f32) -> i32 {
     let mut score = 0;
 
     let my_pawns = board.by_color(color).intersect(board.by_role(Role::Pawn));
@@ -221,15 +215,16 @@ pub fn king_pawn_distance(color: Color, board: &Board, phase: i32) -> i32 {
             score += file_dist.max(rank_dist) * 15;
         }
     }
-    score * ((PHASE_MAX - phase) / PHASE_MAX)
+    (score as f32 * (1.0 - phase)) as i32
 }
 
-pub fn phase(board: &Board) -> i32 {
+pub fn phase(board: &Board) -> f32 {
     let mut npm = 0;
     for role in [Role::Knight, Role::Bishop, Role::Rook, Role::Queen] {
         npm += piece_value(role) * board.by_role(role).count() as i32;
     }
-    npm.min(PHASE_MAX)
+    let p: f32 = npm as f32 / PHASE_MAX as f32;
+    p.min(1.0)
 }
 
 pub const fn reverse(table: [i32; 64]) -> [i32; 64] {

@@ -4,7 +4,7 @@ A Rust chess engine based on the [shakmaty](https://github.com/niklasf/shakmaty)
 
 Implements:
 
-- Minimax with:
+- Negamax with:
   - Alpha-Beta Pruning
   - Iterative Deepening
   - Aspiration window
@@ -12,9 +12,11 @@ Implements:
   - Transposition Table with Zobrist hashing
   - Late Move Reduction
   - Null move pruning
+  - Principal Variation Search
   - Move ordering with:
     - MVV-LVA (Most Valuable Victim - Least Valuable Attacker)
     - Silent move history
+    - Killer moves
 
 ## UCI compatibility
 

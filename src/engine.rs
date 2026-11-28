@@ -1,13 +1,34 @@
 use std::io;
 use std::io::Write;
 use std::time::{Duration, Instant};
-use shakmaty::{Chess, Position, Move, Color, MoveList, Role, PlayError, EnPassantMode, zobrist::Zobrist64, CastlingMode, Setup, PositionError};
+use shakmaty::{Chess, Position, Move, Color, MoveList, Role, PlayError, EnPassantMode, zobrist::Zobrist64, CastlingMode, PositionError};
 use rand;
-use shakmaty::fen::Fen;
-use crate::constants::{INF, TABLE_SIZE, PHASE_MAX, NMP, LMR, LMR_T2, LMR_T1, piece_value, piece_square_value, king_pawn_distance, phase};
+use crate::constants::{INF, TABLE_SIZE, PHASE_MAX, NMP, LMR, LMR_T1, piece_value, piece_square_value, king_pawn_distance, phase};
 use crate::opening_book::OpeningBook;
 use crate::transition_table::{TranspositionTable, EntryType, TTEntry};
 
+// mate score: a mate delivered at ply p has score MATE - p (so faster mates score higher)
+const MATE: i32 = 1_000_000;
+const MATE_BOUND: i32 = MATE - 1_000;
+const MAX_PLY: usize = 128;
+// quiescence: captures that cannot reach alpha even with this extra margin are skipped
+const DELTA_MARGIN: i32 = 200;
+// history values must stay below the killer score used in move ordering
+const HISTORY_MAX: i32 = 5_000_000;
+
+const SCORE_TT_MOVE: i32 = 1_000_000_000;
+const SCORE_CAPTURE: i32 = 10_000_000;
+const SCORE_PROMOTION: i32 = 9_500_000;
+const SCORE_KILLER_1: i32 = 9_000_000;
+const SCORE_KILLER_2: i32 = 8_900_000;
+
+fn score_to_tt(score: i32, ply: i32) -> i32 {
+    if score >= MATE_BOUND { score + ply } else if score <= -MATE_BOUND { score - ply } else { score }
+}
+
+fn score_from_tt(score: i32, ply: i32) -> i32 {
+    if score >= MATE_BOUND { score - ply } else if score <= -MATE_BOUND { score + ply } else { score }
+}
 
 #[derive(Clone)]
 pub struct Game {
@@ -45,17 +66,32 @@ impl Game {
     pub fn current(&self) -> &Chess {
         self.history.last().unwrap()
     }
-    
+
+    // hash of the current position (already computed by push / null_move)
+    pub fn hash(&self) -> Zobrist64 {
+        *self.hashes.last().unwrap()
+    }
+
     pub fn len(&self) -> usize {
         self.history.len()
     }
 
+    // checked version, used for moves coming from outside (GUI)
     pub fn push(&mut self, mv: Move) -> Result<(), PlayError<Chess>> {
         let next = self.current().clone().play(mv)?;
         let hash = next.zobrist_hash::<Zobrist64>(EnPassantMode::Legal);
         self.history.push(next);
         self.hashes.push(hash);
         Ok(())
+    }
+
+    // unchecked version, used in the search (moves come from legal_moves())
+    pub fn push_unchecked(&mut self, mv: Move) {
+        let mut next = self.current().clone();
+        next.play_unchecked(mv);
+        let hash = next.zobrist_hash::<Zobrist64>(EnPassantMode::Legal);
+        self.history.push(next);
+        self.hashes.push(hash);
     }
 
     pub fn pop(&mut self) -> Option<Chess> {
@@ -82,29 +118,42 @@ impl Game {
         }
     }
 
-    pub fn get_phase(&self) -> i32 {
+    pub fn get_phase(&self) -> f32 {
         phase(self.current().board())
     }
 
     pub fn is_endgame(&self) -> bool {
-        if self.get_phase() <= (PHASE_MAX/3) { true } else { false }
+        if self.get_phase() <= 0.33 { true } else { false }
     }
 
     pub fn null_move(&mut self) -> Result<(), PositionError<Chess>> {
-        let fen = Fen::from_position(self.current(), EnPassantMode::Legal);
-        let mut setup: Setup = Setup::from(fen);
-        setup.swap_turn();
-        let null_pos: Chess = setup.position(CastlingMode::Standard)?;
+        let null_pos = self.current().clone().swap_turn()?;
         let hash = null_pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal);
         self.history.push(null_pos);
         self.hashes.push(hash);
         Ok(())
     }
 }
+
 #[derive(Clone)]
 pub struct SearchResult {
     pub best_move: Move,
     pub score: i32,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct SearchStats {
+    pub nodes: u64,
+    pub q_nodes: u64,
+    pub tt_hits: u64,
+    pub nmp_tried: u64,
+    pub nmp_succ: u64,
+    pub lmr_tried: u64,
+    pub lmr_succ: u64,
+    
+    // beta cutoffs, and how many of them happened on the first move (ordering quality)
+    pub cutoffs: u64,
+    pub first_cutoffs: u64,
 }
 
 pub struct Engine {
@@ -123,19 +172,21 @@ pub struct Engine {
     hash_table: TranspositionTable,
     q_hash_table: TranspositionTable,
     silent_history: [[i32; 64]; 64],
+    killers: [[Option<Move>; 2]; MAX_PLY],
+    lmr_table: [[i32; 64]; 64],
 
-    // stats
-    iterations: i32,
-    q_iterations: i32,
-    memo_iterations: i32,
-    nmp_iterations: i32,
-    nmp_success: i32,
-    lmr_iterations: i32,
-    lmr_success: i32,
+    stats: SearchStats,
 }
 
 impl Engine {
     pub fn new(g: Game, c: Color) -> Self {
+        let mut lmr_table = [[0i32; 64]; 64];
+        for d in 1..64 {
+            for i in 1..64 {
+                lmr_table[d][i] = (0.75 + (d as f64).ln() * (i as f64).ln() / 2.25) as i32;
+            }
+        }
+
         Engine {
             game: g,
             color: c,
@@ -152,14 +203,10 @@ impl Engine {
             hash_table: TranspositionTable::new(TABLE_SIZE),
             q_hash_table: TranspositionTable::new(TABLE_SIZE),
             silent_history: [[0; 64]; 64],
+            killers: [[None; 2]; MAX_PLY],
+            lmr_table,
 
-            iterations: 0,
-            q_iterations: 0,
-            memo_iterations: 0,
-            nmp_iterations: 0,
-            nmp_success: 0,
-            lmr_iterations: 0,
-            lmr_success: 0,
+            stats: SearchStats::default(),
         }
     }
 
@@ -167,7 +214,6 @@ impl Engine {
         self.game = game;
         self.best_move = None;
         self.best_score = 0;
-        //self.silent_history = [[0; 64]; 64];
     }
 
     pub fn set_max_depth(&mut self, max_depth: i32) {
@@ -180,12 +226,7 @@ impl Engine {
     }
 
     pub fn set_color(&mut self, color: Color) {
-        if color != self.color {
-            self.color = color;
-            self.hash_table.clear();
-            self.q_hash_table.clear();
-            self.silent_history = [[0; 64]; 64];
-        }
+        self.color = color;
     }
 
     pub fn get_color(&self) -> Color {
@@ -196,11 +237,18 @@ impl Engine {
         self.best_score
     }
 
-    pub fn get_stats(&self) -> (i32, i32, i32, i32, i32) {
-        (self.iterations, self.q_iterations, self.memo_iterations, self.hash_table.get_len(), self.q_hash_table.get_len())
+    pub fn get_stats(&self) -> SearchStats {
+        self.stats
+    }
+
+    pub fn get_search_stats(&self) -> &SearchStats {
+        &self.stats
     }
 
     pub fn is_timeout(&mut self) -> bool {
+        if self.stopped {
+            return true;
+        }
         self.time_check += 1;
         if self.time_check >= 2048 {
             self.time_check = 0;
@@ -215,21 +263,33 @@ impl Engine {
         let mut pv_str = shakmaty::uci::UciMove::from_move(self.best_move.unwrap(), CastlingMode::Standard).to_string();
         if depth > 0 {
             let pv = self.extract_pv(depth);
-            pv_str = pv.iter()
-                .map(|m| shakmaty::uci::UciMove::from_move(*m, CastlingMode::Standard).to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
+            if !pv.is_empty() {
+                pv_str = pv.iter()
+                    .map(|m| shakmaty::uci::UciMove::from_move(*m, CastlingMode::Standard).to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
         } else {
             // move from opening book
             depth = 1;
         }
 
+        let score_str = if self.best_score.abs() >= MATE_BOUND {
+            let moves = (MATE - self.best_score.abs() + 1) / 2;
+            format!("mate {}", if self.best_score > 0 { moves } else { -moves })
+        } else {
+            format!("cp {}", self.best_score)
+        };
 
-        println!("info depth {} score cp {} nodes {} time {} pv {}",
+        let nodes = self.stats.nodes + self.stats.q_nodes + self.stats.tt_hits;
+        let ms = self.start_timer.elapsed().as_millis().max(1);
+
+        println!("info depth {} score {} nodes {} nps {} time {} pv {}",
                  depth,
-                 self.best_score,
-                 self.iterations + self.q_iterations + self.memo_iterations,
-                 self.start_timer.elapsed().as_millis(),
+                 score_str,
+                 nodes,
+                 (nodes as u128) * 1000 / ms,
+                 ms,
                  pv_str
         );
         io::stdout().flush().unwrap();
@@ -240,12 +300,12 @@ impl Engine {
         let mut game = self.game.clone();
 
         for _ in 0..depth {
-            let h = game.current().zobrist_hash::<Zobrist64>(EnPassantMode::Legal);
+            let h = game.hash();
             if let Some(entry) = self.hash_table.get(h) {
                 if let Some(mv) = entry.best_move {
                     if game.current().legal_moves().contains(&mv) {
                         pv.push(mv);
-                        game.push(mv).ok();
+                        game.push_unchecked(mv);
                     } else {
                         break;
                     }
@@ -263,38 +323,47 @@ impl Engine {
 
         // search opening book
         if let Some(book) = opening_book {
-            let hash = u64::from(self.game.current().zobrist_hash::<Zobrist64>(EnPassantMode::Legal));
-            let moves = book.get_moves(hash);
+            let hash = u64::from(self.game.hash());
 
-            if !moves.is_empty() {
+            // keep only the book moves that can be decoded in this position
+            let candidates: Vec<(Move, u32)> = book.get_moves(hash)
+                .iter()
+                .filter_map(|e| e.decode_move(self.game.current()).map(|m| (m, e.weight as u32)))
+                .collect();
+            let tot_weight: u32 = candidates.iter().map(|c| c.1).sum();
+
+            if tot_weight > 0 {
                 // select random move from book
                 // probability based on "weight" of move in the book
-                let tot_weight = moves.iter().map(|m| m.weight).sum();
                 let mut choice = rand::random_range(0..tot_weight);
 
-                for entry in moves {
-                    if choice < entry.weight {
-                        if let Some(mv) = entry.decode_move(self.game.current()) {
-                            self.best_move = Some(mv);
-                            self.game.push(mv).ok();
-                            self.best_score = self.eval();
-                            self.game.pop();
-                            if print_info {
-                                self.print_info(0);
-                            }
-                            return SearchResult { best_move: self.best_move.unwrap(), score: self.best_score };
+                for (mv, weight) in candidates {
+                    if choice < weight {
+                        self.best_move = Some(mv);
+                        self.game.push_unchecked(mv);
+                        // after the move the side to move is the opponent
+                        self.best_score = -self.eval();
+                        self.game.pop();
+                        if print_info {
+                            self.print_info(0);
                         }
+                        return SearchResult { best_move: mv, score: self.best_score };
                     }
-                    choice -= entry.weight;
+                    choice -= weight;
                 }
             }
         }
 
         self.best_move = None;
         self.best_score = 0;
-        self.iterations = 0;
-        self.q_iterations = 0;
-        self.memo_iterations = 0;
+        self.stats = SearchStats::default();
+        self.killers = [[None; 2]; MAX_PLY];
+        // age the history between searches
+        for row in self.silent_history.iter_mut() {
+            for v in row.iter_mut() {
+                *v /= 2;
+            }
+        }
 
         let mut prev_res: Vec<SearchResult> = vec![];
 
@@ -307,33 +376,33 @@ impl Engine {
         let mut stable = 0;
         let mut prev_best: Option<Move> = None;
         let mut prev_score = 0;
+        let mut prev_elapsed = 0u64;
 
         // with iterative deepening
         for depth in 1..=self.max_depth {
 
             let score = if depth <= 2 {
                 // first two iterations have a "full" window
-                self.minimax(depth, true, -INF, INF, false)
+                self.negamax(depth, 0, -INF, INF, false)
             } else {
                 // use aspiration window on later iterations
                 let mut delta = 50;
-                let mut alpha = prev_res[depth as usize - 2].score - delta;
-                let mut beta = prev_res[depth as usize - 2].score + delta;
+                let last = prev_res[depth as usize - 2].score;
+                let mut alpha = (last - delta).max(-INF);
+                let mut beta = (last + delta).min(INF);
 
                 loop {
-                    let score = self.minimax(depth, true, alpha, beta, false);
-
-                    if score.is_none() {
-                        break None;
-                    }
-                    if score <= Some(alpha) {
-                        alpha -= delta;
-                        delta *= 2;
-                    } else if score >= Some(beta) {
-                        beta += delta;
-                        delta *= 2;
-                    } else {
-                        break score;
+                    match self.negamax(depth, 0, alpha, beta, false) {
+                        None => break None,
+                        Some(s) if s <= alpha => {
+                            alpha = (alpha - delta).max(-INF);
+                            delta *= 2;
+                        }
+                        Some(s) if s >= beta => {
+                            beta = (beta + delta).min(INF);
+                            delta *= 2;
+                        }
+                        Some(s) => break Some(s),
                     }
                 }
             };
@@ -353,19 +422,12 @@ impl Engine {
                 score: self.best_score,
             });
 
-            let root_hash = self.game.current().zobrist_hash(EnPassantMode::Legal);
-            if let Some(entry) = self.hash_table.get(root_hash) {
-                if entry.best_move.is_some() {
-                    self.best_move = entry.best_move;
-                }
-            }
-
             if print_info {
                 self.print_info(depth);
             }
 
-            // only one move available or no moves at all
-            if only_move {
+            // only one move available or no moves at all, or a forced mate was found
+            if only_move || self.best_score.abs() >= MATE_BOUND {
                 break;
             }
 
@@ -383,8 +445,12 @@ impl Engine {
             }
             target = target.min(self.hard_timer.as_millis() as u64);
 
+            // do not start an iteration that is not expected to finish in time
+            // (an iteration costs about 3 times the previous one)
             let elapsed = self.start_timer.elapsed().as_millis() as u64;
-            if elapsed >= target * 6 / 10 {
+            let last_iter = elapsed - prev_elapsed;
+            prev_elapsed = elapsed;
+            if elapsed + last_iter * 3 > target {
                 break;
             }
 
@@ -397,28 +463,54 @@ impl Engine {
         }
     }
 
-    fn order_moves(&mut self, mut moves: MoveList, h_move: Option<Move>) -> MoveList {
-        moves.sort_by_key(|m| {
-            if Some(m) == h_move.as_ref() {
-                return -INF;
-            }
-            if m.is_capture() {
-                let captured = m.capture().unwrap();
-                let attacker = m.role();
-                return -self.mvv_lva_eval(captured, attacker);
-            }
-            let from = m.from().unwrap() as usize;
-            let to = m.to() as usize;
-            -self.silent_history[from][to]
-        });
-        moves
+    fn score_moves(&self, moves: &MoveList, tt_move: Option<Move>, ply: usize, scores: &mut [i32; 256]) {
+        for (i, m) in moves.iter().enumerate() {
+            scores[i] = if Some(*m) == tt_move {
+                SCORE_TT_MOVE
+            } else if m.is_capture() {
+                // MVV-LVA
+                SCORE_CAPTURE + piece_value(m.capture().unwrap()) * 10 - piece_value(m.role())
+            } else if let Some(promotion) = m.promotion() {
+                SCORE_PROMOTION + piece_value(promotion)
+            } else if self.killers[ply][0] == Some(*m) {
+                SCORE_KILLER_1
+            } else if self.killers[ply][1] == Some(*m) {
+                SCORE_KILLER_2
+            } else {
+                self.silent_history[m.from().unwrap() as usize][m.to() as usize]
+            };
+        }
     }
 
-    fn mvv_lva_eval(&mut self, victim: Role, role: Role) -> i32 {
-        piece_value(victim) * 10 - piece_value(role)
+    // selection of the best remaining move: most of the time a cutoff happens after few moves, so a full sort would be useless
+    fn pick_next(moves: &mut MoveList, scores: &mut [i32; 256], start: usize) {
+        let mut best = start;
+        for j in (start + 1)..moves.len() {
+            if scores[j] > scores[best] {
+                best = j;
+            }
+        }
+        if best != start {
+            moves.swap(start, best);
+            scores.swap(start, best);
+        }
     }
 
-    fn eval(&self) -> i32 {
+    fn store_killer(&mut self, ply: i32, m: Move) {
+        let p = ply as usize;
+        if self.killers[p][0] != Some(m) {
+            self.killers[p][1] = self.killers[p][0];
+            self.killers[p][0] = Some(m);
+        }
+    }
+
+    fn update_history(&mut self, m: Move, depth: i32) {
+        let v = &mut self.silent_history[m.from().unwrap() as usize][m.to() as usize];
+        *v = (*v + depth * depth).min(HISTORY_MAX);
+    }
+
+    // white minus black
+    fn eval_white(&self) -> i32 {
         let board = self.game.current().board();
         let phase = self.game.get_phase();
         let mut score = 0;
@@ -432,7 +524,7 @@ impl Engine {
                 }
             }
             value += king_pawn_distance(color, board, phase);
-            if color == self.color {
+            if color == Color::White {
                 score += value;
             } else {
                 score -= value;
@@ -441,278 +533,317 @@ impl Engine {
         score
     }
 
-    fn quiescence_search(&mut self, depth: i32, mut alpha: i32, mut beta: i32) -> Option<i32> {
+    // score from the point of view of the side to move
+    fn eval(&self) -> i32 {
+        let e = self.eval_white();
+        if self.game.current().turn() == Color::White { e } else { -e }
+    }
+
+    // zugzwang guard for null move pruning: the side to move needs pieces other than pawns and king
+    fn has_non_pawn_material(&self) -> bool {
+        let pos = self.game.current();
+        let board = pos.board();
+        let mine = board.by_color(pos.turn());
+        mine.count() > (mine & (board.pawns() | board.kings())).count()
+    }
+
+    fn is_draw(&self, null_move: bool) -> bool {
+        // a position that already appeared once is scored as a draw inside the search
+        // (the position after a null move can coincide with a real one, so skip it)
+        if !null_move && self.game.count_repetitions(2) {
+            return true;
+        }
+        self.game.maxed_moves() && !self.game.current().is_checkmate()
+    }
+
+    // ---- search ----
+
+    fn quiescence(&mut self, mut alpha: i32, beta: i32, ply: i32) -> Option<i32> {
 
         // check timer
         if self.is_timeout() {
             return None;
         }
+        self.stats.q_nodes += 1;
 
-        // memoization with Zobrist hashes
-        let h: Zobrist64 = self.game.current().zobrist_hash(EnPassantMode::Legal);
-        let mut h_move: Option<Move> = None;
+        if ply >= MAX_PLY as i32 - 1 {
+            return Some(self.eval());
+        }
+
+        // memoization with Zobrist hashes (qsearch entries are all stored with depth 0)
+        let h = self.game.hash();
+        let mut tt_move: Option<Move> = None;
 
         if let Some(entry) = self.q_hash_table.get(h) {
-            h_move = entry.best_move;
-            if entry.depth >= depth {
-                self.memo_iterations += 1;
-                match entry.entry_type {
-                    EntryType::Exact => return Some(entry.score),
-                    EntryType::LowerBound => alpha = alpha.max(entry.score),
-                    EntryType::UpperBound => beta = beta.min(entry.score),
-                }
-                if alpha >= beta {
-                    return Some(entry.score);
-                }
-            }
-
-        }
-
-        self.q_iterations += 1;
-
-        let is_max = self.game.current().turn() == self.color;
-        let moves = self.game.current().legal_moves();
-
-        // check if game ended
-        if moves.is_empty() {
-            return if self.game.current().is_checkmate() {
-                if is_max { Some(-INF) } else { Some(INF) }
-            } else {
-                Some(0)
+            tt_move = entry.best_move;
+            let s = score_from_tt(entry.score, ply);
+            let cut = match entry.entry_type {
+                EntryType::Exact => true,
+                EntryType::LowerBound => s >= beta,
+                EntryType::UpperBound => s <= alpha,
             };
-        }
-
-        // draw by special case
-        if self.game.maxed_moves() || self.game.count_repetitions(3) {
-            return Some(0);
-        }
-
-        let mut best_score = self.eval();
-        let mut active_moves = self.order_moves(moves, h_move);
-
-        // score of position with no capture if not in check
-        if !self.game.current().is_check(){
-            if is_max {
-                if best_score >= beta { return Some(beta); }
-                alpha = alpha.max(best_score);
-            } else {
-                if best_score <= alpha { return Some(alpha); }
-                beta = beta.min(best_score);
-            }
-            // if not in check explore only capture moves
-            active_moves = active_moves.into_iter().filter(|m| m.is_capture()).collect();
-        }
-
-        let original_alpha = alpha;
-        let original_beta = beta;
-        let mut local_best_move: Option<Move> = None;
-
-        for m in active_moves {
-            if self.is_timeout() { return None }
-
-            if self.game.push(m).is_err() { continue; }
-
-            let score = self.quiescence_search(depth - 1, alpha, beta);
-
-            self.game.pop();
-
-            match score {
-                None => { return None; },
-                _ => {}
-            }
-
-            let is_better = if is_max { score > Some(best_score) } else { score < Some(best_score) };
-            if is_better {
-                best_score = score.unwrap();
-                local_best_move = Some(m);
-            }
-
-            if is_max {
-                alpha = alpha.max(best_score);
-                if best_score >= beta { break; }
-            } else {
-                beta = beta.min(best_score);
-                if best_score <= alpha { break; }
+            if cut {
+                self.stats.tt_hits += 1;
+                return Some(s);
             }
         }
 
-        let et = if best_score <= original_alpha {
-            EntryType::UpperBound
-        } else if best_score >= original_beta {
-            EntryType::LowerBound
+        let in_check = self.game.current().is_check();
+        let alpha_orig = alpha;
+
+        let mut best_score;
+        let mut stand_pat = -INF;
+
+        if in_check {
+            // no stand pat when in check: every evasion must be searched
+            best_score = -MATE + ply;
         } else {
+            stand_pat = self.eval();
+            if stand_pat >= beta {
+                return Some(stand_pat);
+            }
+            best_score = stand_pat;
+            if stand_pat > alpha {
+                alpha = stand_pat;
+            }
+        }
+
+        let mut moves = self.game.current().legal_moves();
+        if !in_check {
+            moves.retain(|m| m.is_capture() || m.promotion() == Some(Role::Queen));
+        }
+
+        if moves.is_empty() {
+            return if in_check { Some(-MATE + ply) } else { Some(stand_pat) };
+        }
+
+        let mut scores = [0i32; 256];
+        self.score_moves(&moves, tt_move, ply as usize, &mut scores);
+
+        let mut best_move: Option<Move> = None;
+
+        for i in 0..moves.len() {
+            Self::pick_next(&mut moves, &mut scores, i);
+            let m = moves[i];
+
+            // delta pruning
+            if !in_check && !m.is_promotion() {
+                if let Some(victim) = m.capture() {
+                    if stand_pat + piece_value(victim) + DELTA_MARGIN <= alpha {
+                        continue;
+                    }
+                }
+            }
+
+            self.game.push_unchecked(m);
+            let res = self.quiescence(-beta, -alpha, ply + 1);
+            self.game.pop();
+            let score = -res?;
+
+            if score > best_score {
+                best_score = score;
+                best_move = Some(m);
+                if score > alpha {
+                    alpha = score;
+                    if alpha >= beta {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let entry_type = if best_score >= beta {
+            EntryType::LowerBound
+        } else if best_score > alpha_orig {
             EntryType::Exact
+        } else {
+            EntryType::UpperBound
         };
 
         self.q_hash_table.insert(TTEntry {
             hash: h,
-            depth: depth,
-            score: best_score,
-            entry_type: et,
-            best_move: local_best_move,
+            depth: 0,
+            score: score_to_tt(best_score, ply),
+            entry_type,
+            best_move: if entry_type == EntryType::UpperBound { tt_move } else { best_move },
         });
 
         Some(best_score)
     }
 
-    pub fn minimax(&mut self, depth: i32, is_root: bool, mut alpha: i32, mut beta: i32, null_move: bool) -> Option<i32> {
+    // search of one child (the move is already on the board):
+    // first move with a full window, the others with a null window (PVS),
+    // possibly reduced (LMR) and re-searched if they turn out to be interesting
+    fn search_child(&mut self, depth: i32, ply: i32, alpha: i32, beta: i32, first: bool, reduction: i32) -> Option<i32> {
+        if first {
+            return Some(-self.negamax(depth - 1, ply + 1, -beta, -alpha, false)?);
+        }
+
+        let mut score = -self.negamax(depth - 1 - reduction, ply + 1, -alpha - 1, -alpha, false)?;
+
+        if reduction > 0 {
+            self.stats.lmr_tried += 1;
+            if score <= alpha {
+                self.stats.lmr_succ += 1;
+            }
+        }
+
+        // the reduced search says the move is good: verify it at full depth
+        if score > alpha && reduction > 0 {
+            score = -self.negamax(depth - 1, ply + 1, -alpha - 1, -alpha, false)?;
+        }
+
+        // inside the window: full window search
+        if score > alpha && score < beta {
+            score = -self.negamax(depth - 1, ply + 1, -beta, -alpha, false)?;
+        }
+
+        Some(score)
+    }
+
+    fn negamax(&mut self, mut depth: i32, ply: i32, mut alpha: i32, beta: i32, null_move: bool) -> Option<i32> {
 
         // check timer
         if self.is_timeout() {
             return None;
         }
 
-        // check draw before tt
-        if !is_root {
-            if !null_move && self.game.count_repetitions(2) {
-                return Some(0);
-            }
-            if self.game.maxed_moves() && !self.game.current().is_checkmate() {
-                return Some(0);
-            }
+        let is_root = ply == 0;
+        let is_pv = beta - alpha > 1;
+
+        // draws (never at the root: the search must always return a move)
+        if !is_root && self.is_draw(null_move) {
+            return Some(0);
         }
+
+        if ply >= MAX_PLY as i32 - 1 {
+            return Some(self.eval());
+        }
+
+        // check extension
+        let in_check = self.game.current().is_check();
+        if in_check {
+            depth += 1;
+        }
+
+        if depth <= 0 {
+            return self.quiescence(alpha, beta, ply);
+        }
+
+        self.stats.nodes += 1;
 
         // memoization with Zobrist hashes
-        let h: Zobrist64 = self.game.current().zobrist_hash(EnPassantMode::Legal);
-        let mut h_move: Option<Move> = None;
+        let h = self.game.hash();
+        let mut tt_move: Option<Move> = None;
 
         if let Some(entry) = self.hash_table.get(h) {
-            h_move = entry.best_move;
+            tt_move = entry.best_move;
             if !is_root && entry.depth >= depth {
-                self.memo_iterations += 1;
-                match entry.entry_type {
-                    EntryType::Exact => return Some(entry.score),
-                    EntryType::LowerBound => alpha = alpha.max(entry.score),
-                    EntryType::UpperBound => beta = beta.min(entry.score),
-                }
-                if alpha >= beta {
-                    return Some(entry.score);
+                let s = score_from_tt(entry.score, ply);
+                let cut = match entry.entry_type {
+                    EntryType::Exact => true,
+                    EntryType::LowerBound => s >= beta,
+                    EntryType::UpperBound => s <= alpha,
+                };
+                if cut {
+                    self.stats.tt_hits += 1;
+                    return Some(s);
                 }
             }
         }
 
-        self.iterations += 1;
-
-        // max depth reached
-        // start quiescence search
-        if depth <= 0 {
-            return self.quiescence_search(-1, alpha, beta)
-        }
-
-        let mut moves = self.game.current().legal_moves();
-        let is_max = self.game.current().turn() == self.color;
-
-        // end condition by no other moves
-        if moves.is_empty() {
-            return if self.game.current().is_checkmate() {
-                if is_max { Some(-INF) } else { Some(INF) }
-            } else {
-                Some(0)
-            }
-        }
-
-        let is_endgame = self.game.is_endgame();
-        let has_captures = moves.iter().any(|m| m.is_capture());
-
-        // Null Move Pruning (NMP)
-        if !null_move && depth >= NMP && !self.game.current().is_check() && !is_endgame && !has_captures && !is_root {
-            if !self.game.null_move().is_err() {
-
-                self.nmp_iterations += 1;
-
-                // reduced search
-                let null_score = self.minimax(depth - NMP, false, alpha, beta, true);
-
+        // null move pruning (NMP)
+        if !null_move && !is_pv && !in_check && depth >= NMP
+            && beta.abs() < MATE_BOUND
+            && self.has_non_pawn_material()
+            && self.eval() >= beta
+        {
+            if self.game.null_move().is_ok() {
+                let r = 3 + depth / 6;
+                let res = self.negamax(depth - 1 - r, ply + 1, -beta, -beta + 1, true);
                 self.game.pop();
-
-                if is_max && null_score >= Some(beta) {
-                    self.nmp_success += 1;
+                let score = -res?;
+                self.stats.nmp_tried += 1;
+                if score >= beta {
+                    self.stats.nmp_succ += 1;
                     return Some(beta);
                 }
             }
         }
 
-        moves = self.order_moves(moves, h_move);
+        let mut moves = self.game.current().legal_moves();
 
-        let mut best_score = if is_max { -INF } else { INF };
-        let mut local_best_move: Option<Move> = None;
-        let original_alpha = alpha;
-        let original_beta = beta;
+        // checkmate or stalemate
+        if moves.is_empty() {
+            return Some(if in_check { -MATE + ply } else { 0 });
+        }
 
-        for (i, m) in moves.iter().enumerate() {
-            if self.is_timeout() { return None }
+        let mut scores = [0i32; 256];
+        self.score_moves(&moves, tt_move, ply as usize, &mut scores);
 
-            // push move and explore down the tree
-            if self.game.push(*m).is_err() { continue; }
+        let alpha_orig = alpha;
+        let mut best_score = -INF;
+        let mut best_move: Option<Move> = None;
 
-            // Late Move Reduction (LMR)
-            let score = if i >= LMR_T1 as usize && depth >= LMR && !self.game.current().is_check() && !m.is_capture() && !is_endgame {
-                self.lmr_iterations += 1;
-                let r_depth = if i >= LMR_T2 as usize { LMR } else { LMR-1 };
-                let red_score = self.minimax(depth - r_depth, false, alpha, beta, false);
-                if red_score > Some(alpha) {
-                    // move is promising despite being late in the order, full search
-                    self.minimax(depth-1, false, alpha, beta, false)
-                } else {
-                    self.lmr_success += 1;
-                    red_score
-                }
-            } else {
-                // normal search
-                self.minimax(depth-1, false, alpha, beta, false)
-            };
+        for i in 0..moves.len() {
+            Self::pick_next(&mut moves, &mut scores, i);
+            let m = moves[i];
+            let is_quiet = !m.is_capture() && !m.is_promotion();
 
-            // pop move to go up the tre
+            self.game.push_unchecked(m);
+            let gives_check = self.game.current().is_check();
+
+            // late move reduction (LMR)
+            let mut reduction = 0;
+            if i as i32 >= LMR_T1 && depth >= LMR && is_quiet && !in_check && !gives_check {
+                let r = self.lmr_table[(depth as usize).min(63)][i.min(63)];
+                reduction = (r - if is_pv { 1 } else { 0 }).clamp(0, depth - 2);
+            }
+
+            let res = self.search_child(depth, ply, alpha, beta, i == 0, reduction);
             self.game.pop();
+            let score = res?;
 
-            match score {
-                None => { return None; },
-                _ => {}
-            }
+            if score > best_score {
+                best_score = score;
+                best_move = Some(m);
 
-            let is_better = if is_max { score > Some(best_score) } else { score < Some(best_score) };
-            // if it's the root of the tree (the possible next move) save the best move
-            if is_better || local_best_move.is_none() {
+                // at the root save the best move
                 if is_root {
-                    self.best_move = Some(*m);
+                    self.best_move = Some(m);
                 }
-                local_best_move = Some(*m);
-            }
 
-            if is_max {
-                best_score = best_score.max(score.unwrap());
-                alpha = alpha.max(best_score);
-                if best_score >= beta {
-                    if !m.is_capture() && !self.game.current().is_check() {
-                        // save "silent" move in history
-                        let from = m.from().unwrap() as usize;
-                        let to = m.to() as usize;
-                        self.silent_history[from][to] += depth * depth;
+                if score > alpha {
+                    alpha = score;
+                    if alpha >= beta {
+                        self.stats.cutoffs += 1;
+                        if i == 0 {
+                            self.stats.first_cutoffs += 1;
+                        }
+                        if is_quiet {
+                            self.store_killer(ply, m);
+                            self.update_history(m, depth);
+                        }
+                        break;
                     }
-                    break;
                 }
-            } else {
-                best_score = best_score.min(score.unwrap());
-                beta = beta.min(best_score);
-                if best_score <= alpha { break; }
             }
         }
 
-        // save in the hash table the position explored
-        let et = if best_score <= original_alpha {
-            EntryType::UpperBound
-        } else if best_score >= original_beta {
+        let entry_type = if best_score >= beta {
             EntryType::LowerBound
-        } else {
+        } else if best_score > alpha_orig {
             EntryType::Exact
+        } else {
+            EntryType::UpperBound
         };
 
         self.hash_table.insert(TTEntry {
             hash: h,
-            depth: depth,
-            score: best_score,
-            entry_type: et,
-            best_move: local_best_move,
+            depth,
+            score: score_to_tt(best_score, ply),
+            entry_type,
+            best_move: if entry_type == EntryType::UpperBound { tt_move } else { best_move },
         });
 
         Some(best_score)
